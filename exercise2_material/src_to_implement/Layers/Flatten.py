@@ -22,12 +22,8 @@ class Flatten(BaseLayer):
 
     def backward(self, error_tensor):
         """
-        将下一层传回的梯度张量（已展平）重新整形回其原始的多维形状。
+        requires: reshapes  and  returns  the  error  tensor.
         """
-        if self.input_shape is None:
-            # 理论上不应该发生，除非没有执行 forward
-            raise ValueError("Flatten layer's input_shape is not set. Run forward pass first.")
-
         # 1. 重新构造目标形状
         # 目标形状是 (Batch_Size, C, H, W)
         target_shape = (error_tensor.shape[0],) + self.input_shape

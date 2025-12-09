@@ -11,18 +11,15 @@ def _prepare_stride_and_padding(input_shape, stride_shape, kernel_shape):
     # stride
     if isinstance(stride_shape, int):
         stride = np.array([stride_shape] * num_dims)
-    elif isinstance(stride_shape, (tuple, list)):
-        if len(stride_shape) != num_dims:
-            raise ValueError(f"stride_shape must have {num_dims} elements for {num_dims}D convolution.")
+    elif isinstance(stride_shape, (tuple,list)):
         stride = np.array(stride_shape)
-    else:
-        raise ValueError("stride_shape must be an int, tuple, or list.")
 
-    # output spatial shape for 'same'-like padding formula used in your code
+    # Calculate Output Spatial Shape
+    # Shape: floor((Input - 1) / Stride) + 1
     output_spatial_shape = np.floor((spatial_input_shape - 1) / stride) + 1
     output_spatial_shape = output_spatial_shape.astype(int)
 
-    # compute symmetric padding from kernel size (same-ish)
+    # compute padding from kernel size
     padding_needed = spatial_kernel_shape - 1
     padding_before = padding_needed // 2
     padding_after = padding_needed - padding_before
@@ -35,19 +32,24 @@ def _prepare_stride_and_padding(input_shape, stride_shape, kernel_shape):
 
     return stride, tuple(padding), output_spatial_shape
 
-
 class Conv:
     def __init__(self, stride_shape, convolution_shape, num_kernels):
         self.trainable = True
-
         self.stride_shape = stride_shape
-        self.convolution_shape = convolution_shape  # [C_in, M] or [C_in, M, N]
-        self.num_kernels = num_kernels
 
+        '''
+        For 1D, it has the convolution  shape [c,  m],  whereas for 2D, it has the shape [c, m, n], where c represents the number of input channels, and m, n represent the
+        spatial extent of the filter kernel.
+        '''
+        self.convolution_shape = convolution_shape
+
+        self.num_kernels = num_kernels  # num kernels is an integer value.
         self.is_2D = (len(convolution_shape) == 3)
         self.num_spatial_dims = 2 if self.is_2D else 1
-
+        # weight Shape: (Num_Kernels, C_in, Spatial_Height, Spatial_Width)
         weight_shape = (num_kernels,) + tuple(convolution_shape)
+
+        # Requirement: Initialize the parameters of this layer uniformly random in the range [0, 1).
         self.weights = np.random.uniform(0, 1, weight_shape)
         self.bias = np.random.uniform(0, 1, (num_kernels,))
 
@@ -69,14 +71,19 @@ class Conv:
     def optimizer(self, optimizer):
         self._optimizer_weights = optimizer
         self._optimizer_bias = copy.deepcopy(optimizer)
-
+########################################################
+    """
+    Requirement:Additionally  provide  two  properties:
+        gradient  weights  and gradient  bias,  which return the gradient with respect to the
+        weights and bias, after they have been calculated in the backward-pass.
+    """
     @property
     def gradient_weights(self):
         return self._gradient_weights
-
     @property
     def gradient_bias(self):
         return self._gradient_bias
+########################################################
 
     def initialize(self, weights_initializer, bias_initializer):
         C_in = self.convolution_shape[0]
@@ -94,7 +101,9 @@ class Conv:
 
     def forward(self, input_tensor):
         """
-        input_tensor: shape (B, C_in, spatial...)
+        The input layout for 1D is defined in b, c, y order, for 2D in b, c, y, x order.  Here,
+        b  stands  for  the  batch,  c  represents  the  channels  and  x,  y  represent  the  spatial
+        dimensions.
         """
         self.input_tensor = input_tensor
         B, C_in, *spatial_in = input_tensor.shape
@@ -106,21 +115,21 @@ class Conv:
         self.stride = stride
         self.padding = padding_tuple
 
-        # pad input
+        # Pad the input tensor with zeros
         padded_input = np.pad(input_tensor, self.padding, mode='constant')
 
-        # prepare output
+        # Initialize the output tensor with zeros
         output_shape = (B, self.num_kernels) + tuple(output_spatial_shape)
         output_tensor = np.zeros(output_shape)
 
-        # slices to apply stride (for spatial dims)
+        # Create slice objects for striding to skip elements in the output to simulate stride > 1
         slices = [slice(None, None, int(s)) for s in self.stride]
 
-        # correlation across channels then stride + bias
+        # Convolve
         for b in range(B):
             for k in range(self.num_kernels):
                 kernel_k = self.weights[k]  # shape (C_in, M, N) or (C_in, M)
-                # sum correlate over channels
+                # Sum the correlation results across all input channels
                 if self.is_2D:
                     corr_sum = None
                     for c in range(padded_input.shape[1]):
@@ -133,7 +142,7 @@ class Conv:
                             corr_sum = corr_c
                         else:
                             corr_sum += corr_c
-                    # corr_sum shape (H_corr, W_corr)
+                    # corr_sum shape is (H_full, W_full) but output is subsampled
                     output_tensor[b, k] = corr_sum[tuple(slices)]
                 else:
                     corr_sum = None
@@ -149,41 +158,46 @@ class Conv:
                             corr_sum += corr_c
                     output_tensor[b, k] = corr_sum[tuple(slices)]
 
-                # add bias
+                # Add Bias to the feature map
                 output_tensor[b, k] += self.bias[k]
 
         return output_tensor
 
+
     def backward(self, error_tensor):
         """
         error_tensor: shape (B, C_out, spatial_out...)
-        returns: pre_layer_error (dX) with same shape as input_tensor
+        require:
+            updates the parameters  using the optimizer (if available) and returns the error  tensor which returns a tensor that
+            servers as error tensor for the next layer.
+
         """
         B, C_out, *spatial_out = error_tensor.shape
         C_in = self.input_tensor.shape[1]
         input_spatial = np.array(self.input_tensor.shape[2:])
 
-        # 1) bias gradient
-        # sum over batch and all spatial dims
+        # 1) Gradient w.r.t Bias
+        # Sum the error tensor over Batch and all Spatial dimensions
         self._gradient_bias = np.sum(error_tensor, axis=(0,) + tuple(range(2, error_tensor.ndim)))
 
-        # 2) upsample error to compensate stride
+        # 2) upsample error（compensate for subsampling in forward pass)
+        # forward pass used stride (downsampling), we must upsample the error
+        # to match the size before striding. We fill the gaps with zeros.
         if self.is_2D:
             H_out, W_out = spatial_out[0], spatial_out[1]
             up_H = H_out * int(self.stride[0])
             up_W = W_out * int(self.stride[1])
             upsampled_error = np.zeros((B, C_out, up_H, up_W))
-            for y in range(H_out):
-                for x in range(W_out):
-                    upsampled_error[:, :, y * int(self.stride[0]), x * int(self.stride[1])] = error_tensor[:, :, y, x]
+            upsampled_error[:, :, ::int(self.stride[0]), ::int(self.stride[1])] = error_tensor
+
         else:
             L_out = spatial_out[0]
             up_L = L_out * int(self.stride[0])
             upsampled_error = np.zeros((B, C_out, up_L))
-            for i in range(L_out):
-                upsampled_error[:, :, i * int(self.stride[0])] = error_tensor[:, :, i]
+            upsampled_error[:, :, ::int(self.stride[0])] = error_tensor
 
         # 3) compute dW (gradient w.r.t. weights) using explicit sliding-window accumulation
+        # dW = Input * Error
         self._gradient_weights = np.zeros_like(self.weights)
         padded_input = np.pad(self.input_tensor, self.padding, mode='constant')
         kernel_spatial = self.weights.shape[2:]
@@ -201,9 +215,11 @@ class Conv:
                                 e_val = upsampled_error[b, k, y, x]
                                 if e_val == 0:
                                     continue
+
                                 inp_patch = padded_input[b, c, y:y + M, x:x + N]
+
+                                # Handle boundary cases where patch is smaller than kernel
                                 if inp_patch.shape != (M, N):
-                                    # pad partial patch to full kernel size (happens at edges)
                                     full_patch = np.zeros((M, N))
                                     h0, w0 = inp_patch.shape
                                     full_patch[:h0, :w0] = inp_patch
@@ -229,14 +245,15 @@ class Conv:
                             grad += inp_patch * e_val
                     self._gradient_weights[k, c] = grad
 
-        # 4) compute dX (pre-layer error)
-        # pad upsampled_error by kernel_size - 1 on spatial dims to prepare for 'valid' conv with flipped kernels
+        # 4) compute E_{n-1} (pre-layer error)
+        # E_{n-1} = Error{n} * Flipped_Weights
+
+        # Padding size = Kernel Size - 1
         pad_for_conv = [ (0,0), (0,0) ]
         for size in kernel_spatial:
             pad_for_conv.append((int(size - 1), int(size - 1)))
         padded_error_full = np.pad(upsampled_error, pad_for_conv, mode='constant')
 
-        # pre_layer_error in padded input coords
         pre_layer_error_padded = np.zeros_like(padded_input)
 
         if self.is_2D:
@@ -247,16 +264,18 @@ class Conv:
                 for c_in in range(C_in):
                     acc = np.zeros((P_h, P_w))
                     for k in range(self.num_kernels):
-                        # flip kernel spatially for dX computation
+                        # flip kernel spatially for E{n-1}
                         w_kc = self.weights[k, c_in]
                         w_kc_flipped = np.flip(w_kc, axis=(0,1))
+
+                        # convolution
                         for m in range(M):
                             for n in range(N):
                                 # extract an error slice aligned with padded_input
                                 err_slice = padded_error_full[b, k, m:m + P_h, n:n + P_w]
                                 acc += err_slice * w_kc_flipped[m, n]
                     pre_layer_error_padded[b, c_in] = acc
-            # remove forward padding to obtain dX of original input spatial size
+            # remove forward padding to obtain E{n-1} of original input spatial size
             pad_before = [p for p in self.padding[2:]]  # exclude batch and channel entries
             y0 = pad_before[0][0]
             x0 = pad_before[1][0]
@@ -278,7 +297,7 @@ class Conv:
             start = pad_before
             pre_layer_error = pre_layer_error_padded[:, :, start:start + input_spatial[0]]
 
-        # 5) update parameters if optimizers provided
+        # 5) update weights and bias
         if self._optimizer_weights is not None:
             self.weights = self._optimizer_weights.calculate_update(self.weights, self._gradient_weights)
             self.bias = self._optimizer_bias.calculate_update(self.bias, self._gradient_bias)
